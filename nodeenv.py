@@ -510,11 +510,12 @@ def callit(cmd, show_stdout=True, in_shell=False,
 
     # error handler
     if proc.returncode:
-        if show_stdout:
-            for s in all_output:
-                logger.critical(s)
-        raise OSError("Command %s failed with error code %s"
-                      % (cmd_desc, proc.returncode))
+        cmd_output = []
+        if not show_stdout:
+            cmd_output.append('. Output:')
+            cmd_output.extend(all_output[-10:])
+        raise OSError("Command %s failed with error code %s%s"
+                      % (cmd_desc, proc.returncode, "\n".join(cmd_output)))
 
     return proc.returncode, all_output
 
@@ -690,6 +691,44 @@ def copy_node_from_prebuilt(env_dir, src_dir, node_version):
     logger.info('.', extra=dict(continued=True))
 
 
+def _need_python2(src_dir, node_src_dir, args, env):
+    """
+    When running under python3, link a python2 binary into the build tree.
+    """
+    if is_PY3:
+        # node.js build scripts prior to 16.0.0 use python2.*,
+        # therefore we need to temporarily point python exec to the
+        # python 2.* version in this case.
+        python2_path = shutil.which('python2', path=env.get('PATH'))
+        if not python2_path:
+            raise OSError(
+                'Python >=3.0 virtualenv detected, but no python2 '
+                'command (required for building node.js) was found'
+            )
+        logger.debug(' * Temporarily pointing python to %s', python2_path)
+        node_tmpbin_dir = join(src_dir, 'tmpbin')
+        node_tmpbin_link = join(node_tmpbin_dir, 'python')
+        mkdir(node_tmpbin_dir)
+        if not os.path.exists(node_tmpbin_link):
+            callit(['ln', '-s', python2_path, node_tmpbin_link])
+        env['PATH'] = '{}:{}'.format(node_tmpbin_dir,
+                                     os.environ.get('PATH', ''))
+
+
+def _need_python3(env):
+    """
+    When running under python2, make sure there's a 'python3' command
+    in the working PATH.
+    """
+    if not is_PY3:
+        python3_path = shutil.which('python3', path=env.get('PATH'))
+        if not python3_path:
+            raise OSError(
+                'Python 2.x virtualenv detected, but no python3 '
+                'command (required for building node.js) was found'
+            )
+
+
 def build_node_from_src(env_dir, src_dir, node_src_dir, args):
     env = {}
     make_param_names = ['load-average', 'jobs']
@@ -703,28 +742,11 @@ def build_node_from_src(env_dir, src_dir, node_src_dir, args):
         if value is not None
     ]
 
-    if getattr(sys.version_info, 'major', sys.version_info[0]) > 2:
-        # Currently, the node.js build scripts are using python2.*,
-        # therefore we need to temporarily point python exec to the
-        # python 2.* version in this case.
-        try:
-            _, which_python2_output = callit(
-                ['which', 'python2'], args.verbose, True, node_src_dir, env
-            )
-            python2_path = which_python2_output[0]
-        except (OSError, IndexError):
-            raise OSError(
-                'Python >=3.0 virtualenv detected, but no python2 '
-                'command (required for building node.js) was found'
-            )
-        logger.debug(' * Temporarily pointing python to %s', python2_path)
-        node_tmpbin_dir = join(src_dir, 'tmpbin')
-        node_tmpbin_link = join(node_tmpbin_dir, 'python')
-        mkdir(node_tmpbin_dir)
-        if not os.path.exists(node_tmpbin_link):
-            callit(['ln', '-s', python2_path, node_tmpbin_link])
-        env['PATH'] = '{}:{}'.format(node_tmpbin_dir,
-                                     os.environ.get('PATH', ''))
+    node_version_tuple = tuple([int(v) for v in args.node.split('.')])
+    if node_version_tuple < (16, 0, 0):
+        _need_python2(src_dir, node_src_dir, args, env)
+    else:
+        _need_python3(env)
 
     conf_cmd = [
         './configure',
@@ -929,10 +951,7 @@ def install_activate(env_dir, args):
         env = os.environ.copy()
         env.update({'PATH': remove_env_bin_from_path(env['PATH'], bin_dir)})
         for candidate in ("nodejs", "node"):
-            which_node_output, _ = subprocess.Popen(
-                ["which", candidate],
-                stdout=subprocess.PIPE, env=env).communicate()
-            shim_node = clear_output(which_node_output)
+            shim_node = shutil.which(candidate, path=env.get('PATH'))
             if shim_node:
                 break
         assert shim_node, "Did not find nodejs or node system executable"
